@@ -33,9 +33,10 @@ async def main() -> None:
         raise RuntimeError("API_ID and API_HASH are required")
     if not settings.hf_token or not settings.hf_repo_id:
         raise RuntimeError("HF_TOKEN and HF_REPO_ID are required")
-    if settings.super_admin_id != REQUIRED_SUPER_ADMIN_ID:
-        logging.info("Enforcing required SUPER_ADMIN_ID=%s", REQUIRED_SUPER_ADMIN_ID)
+    if settings.super_admin_id == 0:
         settings.super_admin_id = REQUIRED_SUPER_ADMIN_ID
+    elif settings.super_admin_id != REQUIRED_SUPER_ADMIN_ID:
+        raise RuntimeError(f"SUPER_ADMIN_ID must be {REQUIRED_SUPER_ADMIN_ID}")
 
     store = HFDataStore(settings)
     await store.initialize()

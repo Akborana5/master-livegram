@@ -113,8 +113,8 @@ class HFDataStore:
                 await asyncio.sleep(self.settings.auto_sync_interval)
                 try:
                     await self.sync()
-                except Exception as exc:
-                    logging.exception("Auto-sync failed: %s", exc)
+                except Exception:
+                    logging.exception("Auto-sync failed")
 
         self._auto_sync_task = asyncio.create_task(_runner())
 

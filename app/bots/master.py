@@ -73,6 +73,7 @@ class MasterController:
         premium = sum(1 for u in users.values() if u.get("premium"))
         blocked = len(data.get("blocked_users", []))
         non_premium = total - premium
+        admin_count = self._assistant_admin_count(data)
         return (
             f"Assistant: {aid}\n"
             f"Total users: {total}\n"
@@ -81,10 +82,18 @@ class MasterController:
             f"Blocked users: {blocked}\n"
             f"Total /start count: {data.get('stats', {}).get('total_starts', 0)}\n"
             f"Total messages received: {data.get('stats', {}).get('total_messages', 0)}\n"
-            f"Admin count: {len(set(data.get('admins', []) + [self.settings.super_admin_id, data.get('owner_id', 0)]))}\n"
+            f"Admin count: {admin_count}\n"
             f"Creation date: {data.get('created_at', '-')}\n"
             f"Last active time: {data.get('last_active_at', '-')}"
         )
+
+    def _assistant_admin_count(self, data: dict[str, Any]) -> int:
+        admins = set(data.get("admins", []))
+        admins.add(self.settings.super_admin_id)
+        owner_id = data.get("owner_id")
+        if owner_id is not None:
+            admins.add(owner_id)
+        return len(admins)
 
     async def _admin_panel(self, event: events.common.EventCommon) -> None:
         assistants = self.store.get_data().get("assistants", {})

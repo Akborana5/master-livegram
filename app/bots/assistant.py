@@ -293,7 +293,7 @@ class AssistantRuntime:
                 elapsed = max(time.time() - started, self.MIN_DIVISOR_SECONDS)
                 speed = index / elapsed
                 remaining = total - index
-                eta = int(remaining / speed) if speed > 0 else 0
+                eta = int(remaining / speed)
                 await status_msg.edit(
                     f"{mark}% completed\n"
                     f"Sent: {index}/{total}\n"
