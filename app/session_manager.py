@@ -47,8 +47,8 @@ class SessionManager:
         for assistant_id, data in assistants.items():
             try:
                 await self.start_assistant(assistant_id, data)
-            except Exception as exc:
-                logging.exception("Failed to start assistant %s: %s", assistant_id, exc)
+            except Exception:
+                logging.exception("Failed to start assistant %s", assistant_id)
 
     async def shutdown(self) -> None:
         for assistant_id in list(self._assistants.keys()):

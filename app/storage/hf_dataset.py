@@ -114,7 +114,7 @@ class HFDataStore:
                 try:
                     await self.sync()
                 except Exception:
-                    logging.exception("Auto-sync failed")
+                    logging.exception("Auto-sync failed for repo %s", self.settings.hf_repo_id)
 
         self._auto_sync_task = asyncio.create_task(_runner())
 

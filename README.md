@@ -25,7 +25,9 @@ Copy `.env.example` to `.env` and fill values:
 - `API_HASH`
 - `HF_TOKEN`
 - `HF_REPO_ID`
-- optional: `HF_DATA_PATH`, `MASTER_SESSION_FILE`, `SUPER_ADMIN_ID`, `AUTO_SYNC_INTERVAL`
+- optional: `HF_DATA_PATH`, `MASTER_SESSION_FILE`, `AUTO_SYNC_INTERVAL`
+
+Super admin is enforced by spec as Telegram user ID `8413365423`.
 
 ## Run locally
 ```bash

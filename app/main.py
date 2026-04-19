@@ -4,7 +4,7 @@ import logging
 from pathlib import Path
 
 from app.bots.master import MasterController
-from app.config import REQUIRED_SUPER_ADMIN_ID, Settings
+from app.config import Settings
 from app.session_manager import SessionManager
 from app.storage.hf_dataset import HFDataStore
 
@@ -33,10 +33,6 @@ async def main() -> None:
         raise RuntimeError("API_ID and API_HASH are required")
     if not settings.hf_token or not settings.hf_repo_id:
         raise RuntimeError("HF_TOKEN and HF_REPO_ID are required")
-    if settings.super_admin_id == 0:
-        settings.super_admin_id = REQUIRED_SUPER_ADMIN_ID
-    elif settings.super_admin_id != REQUIRED_SUPER_ADMIN_ID:
-        raise RuntimeError(f"SUPER_ADMIN_ID must be {REQUIRED_SUPER_ADMIN_ID}")
 
     store = HFDataStore(settings)
     await store.initialize()

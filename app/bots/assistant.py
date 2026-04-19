@@ -19,7 +19,7 @@ from app.utils.media import send_payload, serialize_message
 
 
 class AssistantRuntime:
-    MIN_DIVISOR_SECONDS = 0.1
+    MIN_ELAPSED_TIME_SECONDS = 0.1
 
     def __init__(
         self,
@@ -290,7 +290,7 @@ class AssistantRuntime:
             if hit:
                 mark = max(hit)
                 completed_marks.add(mark)
-                elapsed = max(time.time() - started, self.MIN_DIVISOR_SECONDS)
+                elapsed = max(time.time() - started, self.MIN_ELAPSED_TIME_SECONDS)
                 speed = index / elapsed
                 remaining = total - index
                 eta = int(remaining / speed)

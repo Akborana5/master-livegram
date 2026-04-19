@@ -1,6 +1,7 @@
 import os
 from dataclasses import dataclass
 
+# Required by product spec: this Telegram user is always super admin.
 REQUIRED_SUPER_ADMIN_ID = 8413365423
 
 
@@ -25,6 +26,6 @@ class Settings:
             hf_repo_id=os.getenv("HF_REPO_ID", ""),
             hf_data_path=os.getenv("HF_DATA_PATH", "database.json"),
             master_session_file=os.getenv("MASTER_SESSION_FILE", "master.session"),
-            super_admin_id=int(os.getenv("SUPER_ADMIN_ID", "0")),
+            super_admin_id=REQUIRED_SUPER_ADMIN_ID,
             auto_sync_interval=int(os.getenv("AUTO_SYNC_INTERVAL", "300")),
         )
