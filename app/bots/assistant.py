@@ -190,7 +190,7 @@ class AssistantRuntime:
         return False
 
     async def _on_new_message(self, event: events.NewMessage.Event) -> None:
-        if event.sender_id is None or not event.is_private:
+        if event.sender_id is None:
             return
 
         self.data["last_active_at"] = datetime.now(timezone.utc).isoformat()
@@ -202,6 +202,9 @@ class AssistantRuntime:
             if await self._handle_admin_command(event):
                 return
             await self._handle_reply_bridge(event)
+            return
+
+        if not event.is_private:
             return
 
         if event.sender_id in self.data.get("blocked_users", []):

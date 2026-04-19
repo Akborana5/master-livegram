@@ -103,8 +103,22 @@ class MasterController:
         pending = self.pending_connect.get(user_id)
         if not pending:
             return
+        mode = pending.get("mode", "connect")
         assistant_id = pending["assistant_id"]
         assistants = self.store.get_data().setdefault("assistants", {})
+        if mode == "replace":
+            old_id = pending["target_assistant_id"]
+            existing = assistants.get(old_id)
+            if not existing:
+                self.pending_connect.pop(user_id, None)
+                return
+            existing["session_b64"] = pending["session_b64"]
+            existing["last_active_at"] = datetime.now(timezone.utc).isoformat()
+            await self.sessions.stop_assistant(old_id)
+            await self.sessions.start_assistant(old_id, existing)
+            self.pending_connect.pop(user_id, None)
+            self.store.mark_dirty()
+            return
         assistants[assistant_id] = {
             "assistant_id": assistant_id,
             "owner_id": user_id,
@@ -143,10 +157,21 @@ class MasterController:
                 if not me:
                     raise ValueError("Invalid session")
                 pending["assistant_id"] = str(me.id)
+                if pending.get("mode") == "replace" and pending.get("target_assistant_id") != str(me.id):
+                    await event.reply("Session user ID does not match selected assistant bot.")
+                    return True
                 pending["session_b64"] = base64.b64encode(session_path.read_bytes()).decode("utf-8")
-                pending["step"] = "log_chat"
+                if pending.get("mode") == "replace":
+                    pending["step"] = "done"
+                else:
+                    pending["step"] = "log_chat"
             finally:
                 await test_client.disconnect()
+
+        if pending.get("mode") == "replace":
+            await self._activate_assistant(event.sender_id or 0)
+            await event.reply("Assistant session replaced and restarted.")
+            return True
 
         await event.reply(
             "Add this assistant bot to a group and make it admin for logs.\n"
@@ -241,7 +266,7 @@ class MasterController:
             return
 
         if data == "m_connect":
-            self.pending_connect[user_id] = {"step": "upload"}
+            self.pending_connect[user_id] = {"step": "upload", "mode": "connect"}
             await event.edit("Upload your .session file now.")
             return
 
@@ -336,6 +361,7 @@ class MasterController:
                 buttons=[
                     [Button.inline("Disconnect bot", data=f"m_adisco:{aid}")],
                     [Button.inline("Wipe all data", data=f"m_awipe:{aid}")],
+                    [Button.inline("Upload/Replace session", data=f"m_areplace:{aid}")],
                 ],
             )
             return
@@ -364,4 +390,20 @@ class MasterController:
                 data_ref["stats"] = {"total_starts": 0, "total_messages": 0}
                 self.store.mark_dirty()
             await event.edit("Assistant data wiped.")
+            return
+
+        if data.startswith("m_areplace:"):
+            if not self._is_admin(user_id):
+                await event.answer("Admin only", alert=True)
+                return
+            aid = data.split(":", 1)[1]
+            if aid not in self.store.get_data().get("assistants", {}):
+                await event.answer("Not found", alert=True)
+                return
+            self.pending_connect[user_id] = {
+                "step": "upload",
+                "mode": "replace",
+                "target_assistant_id": aid,
+            }
+            await event.edit(f"Upload replacement .session for assistant {aid}.")
             return
