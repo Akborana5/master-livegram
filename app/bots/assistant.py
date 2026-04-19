@@ -250,7 +250,12 @@ class AssistantRuntime:
         )
 
     async def _broadcast(self, admin_id: int, payload: dict[str, Any], status_msg: Message) -> None:
-        users = [int(x) for x in self.data.get("users", {}).keys() if int(x) not in self.data.get("blocked_users", [])]
+        blocked_users = set(self.data.get("blocked_users", []))
+        users = []
+        for user_key in self.data.get("users", {}).keys():
+            user_id = int(user_key)
+            if user_id not in blocked_users:
+                users.append(user_id)
         total = len(users)
         if total == 0:
             await status_msg.edit("No users to broadcast.")
@@ -290,6 +295,7 @@ class AssistantRuntime:
             if hit:
                 mark = max(hit)
                 completed_marks.add(mark)
+                # Keep divisor non-zero for speed/ETA calculations.
                 elapsed = max(time.time() - started, self.MIN_ELAPSED_TIME_SECONDS)
                 speed = index / elapsed
                 remaining = total - index

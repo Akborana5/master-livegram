@@ -30,7 +30,10 @@ class SessionManager:
         session_b64 = assistant_data.get("session_b64", "")
         session_path = self.base_dir / f"{assistant_id}.session"
         if session_b64:
-            session_path.write_bytes(base64.b64decode(session_b64.encode("utf-8")))
+            try:
+                session_path.write_bytes(base64.b64decode(session_b64.encode("utf-8")))
+            except Exception as exc:
+                raise ValueError(f"Corrupted session data for assistant {assistant_id}") from exc
 
         runtime = AssistantRuntime(self.settings, self.store, assistant_id, str(session_path))
         await runtime.start()

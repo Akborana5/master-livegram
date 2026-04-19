@@ -7,6 +7,7 @@ from telethon.tl.custom.message import Message
 
 
 async def serialize_message(client: TelegramClient, message: Message) -> dict[str, Any]:
+    msg_file = getattr(message, "file", None)
     payload: dict[str, Any] = {
         "text": message.raw_text or "",
         "caption": message.text or "",
@@ -15,8 +16,8 @@ async def serialize_message(client: TelegramClient, message: Message) -> dict[st
         raw = await client.download_media(message, file=bytes)
         if raw:
             payload["media_b64"] = base64.b64encode(raw).decode("utf-8")
-            payload["mime_type"] = getattr(getattr(message, "file", None), "mime_type", "application/octet-stream")
-            payload["name"] = getattr(getattr(message, "file", None), "name", "file")
+            payload["mime_type"] = getattr(msg_file, "mime_type", "application/octet-stream")
+            payload["name"] = getattr(msg_file, "name", "file")
     return payload
 
 
