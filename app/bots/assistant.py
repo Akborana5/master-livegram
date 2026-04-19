@@ -19,6 +19,8 @@ from app.utils.media import send_payload, serialize_message
 
 
 class AssistantRuntime:
+    MIN_ELAPSED_SECONDS = 0.1
+
     def __init__(
         self,
         settings: Settings,
@@ -126,7 +128,7 @@ class AssistantRuntime:
                 if target not in self.data["admins"]:
                     self.data["admins"].append(target)
             elif command == "/demote":
-                self.data["admins"] = [x for x in self.data.get("admins", []) if x != target and x != self.settings.super_admin_id]
+                self.data["admins"] = [x for x in self.data.get("admins", []) if x != target]
             self.store.mark_dirty()
             await event.reply("Updated.")
             return True
@@ -287,7 +289,7 @@ class AssistantRuntime:
             if hit:
                 mark = max(hit)
                 completed_marks.add(mark)
-                elapsed = max(time.time() - started, 0.1)
+                elapsed = max(time.time() - started, self.MIN_ELAPSED_SECONDS)
                 speed = index / elapsed
                 remaining = total - index
                 eta = int(remaining / speed) if speed > 0 else 0

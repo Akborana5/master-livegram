@@ -1,9 +1,9 @@
 import asyncio
 import copy
 import json
-import os
 import tempfile
 from datetime import datetime, timezone
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -113,8 +113,8 @@ class HFDataStore:
                 await asyncio.sleep(self.settings.auto_sync_interval)
                 try:
                     await self.sync()
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logging.exception("Auto-sync failed: %s", exc)
 
         self._auto_sync_task = asyncio.create_task(_runner())
 

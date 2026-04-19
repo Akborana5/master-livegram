@@ -82,8 +82,8 @@ class MasterController:
             f"Total /start count: {data.get('stats', {}).get('total_starts', 0)}\n"
             f"Total messages received: {data.get('stats', {}).get('total_messages', 0)}\n"
             f"Admin count: {len(set(data.get('admins', []) + [self.settings.super_admin_id, data.get('owner_id', 0)]))}\n"
-            f"Creation date: {data.get('created_at', '-') }\n"
-            f"Last active time: {data.get('last_active_at', '-') }"
+            f"Creation date: {data.get('created_at', '-')}\n"
+            f"Last active time: {data.get('last_active_at', '-')}"
         )
 
     async def _admin_panel(self, event: events.common.EventCommon) -> None:

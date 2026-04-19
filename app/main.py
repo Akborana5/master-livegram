@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import logging
 from pathlib import Path
 
 from app.bots.master import MasterController
@@ -23,6 +24,10 @@ async def ensure_master_session(settings: Settings, store: HFDataStore) -> None:
 
 
 async def main() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s - %(message)s",
+    )
     settings = Settings.from_env()
     if not settings.api_id or not settings.api_hash:
         raise RuntimeError("API_ID and API_HASH are required")

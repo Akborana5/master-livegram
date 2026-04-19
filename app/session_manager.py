@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -46,8 +47,8 @@ class SessionManager:
         for assistant_id, data in assistants.items():
             try:
                 await self.start_assistant(assistant_id, data)
-            except Exception:
-                continue
+            except Exception as exc:
+                logging.exception("Failed to start assistant %s: %s", assistant_id, exc)
 
     async def shutdown(self) -> None:
         for assistant_id in list(self._assistants.keys()):
