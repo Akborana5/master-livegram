@@ -19,7 +19,7 @@ from app.utils.media import send_payload, serialize_message
 
 
 class AssistantRuntime:
-    MIN_ELAPSED_SECONDS = 0.1
+    MIN_DIVISOR_SECONDS = 0.1
 
     def __init__(
         self,
@@ -184,7 +184,8 @@ class AssistantRuntime:
             await event.reply(
                 "Are you sure you want to broadcast to all users?",
                 buttons=[
-                    [Button.inline("YES", data=f"abcyes:{self.assistant_id}"), Button.inline("CANCEL", data=f"abcancel:{self.assistant_id}")]
+                    [Button.inline("YES", data=f"abcyes:{self.assistant_id}")],
+                    [Button.inline("CANCEL", data=f"abcancel:{self.assistant_id}")],
                 ],
             )
             return True
@@ -289,7 +290,7 @@ class AssistantRuntime:
             if hit:
                 mark = max(hit)
                 completed_marks.add(mark)
-                elapsed = max(time.time() - started, self.MIN_ELAPSED_SECONDS)
+                elapsed = max(time.time() - started, self.MIN_DIVISOR_SECONDS)
                 speed = index / elapsed
                 remaining = total - index
                 eta = int(remaining / speed) if speed > 0 else 0

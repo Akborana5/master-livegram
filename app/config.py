@@ -1,6 +1,8 @@
 import os
 from dataclasses import dataclass
 
+REQUIRED_SUPER_ADMIN_ID = 8413365423
+
 
 @dataclass(slots=True)
 class Settings:
@@ -23,6 +25,6 @@ class Settings:
             hf_repo_id=os.getenv("HF_REPO_ID", ""),
             hf_data_path=os.getenv("HF_DATA_PATH", "database.json"),
             master_session_file=os.getenv("MASTER_SESSION_FILE", "master.session"),
-            super_admin_id=int(os.getenv("SUPER_ADMIN_ID", "8413365423")),
+            super_admin_id=int(os.getenv("SUPER_ADMIN_ID", "0")),
             auto_sync_interval=int(os.getenv("AUTO_SYNC_INTERVAL", "300")),
         )
