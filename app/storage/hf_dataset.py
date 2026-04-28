@@ -111,6 +111,8 @@ class HFDataStore:
                     self.data["assistants"][aid] = a_data
                 else:
                     logger.warning("Assistant file for %s not found in HF; skipping.", aid)
+                    # Stale ID – update main_db on the next sync to remove it.
+                    self._main_dirty = True
 
     def get_data(self) -> dict[str, Any]:
         return self.data
@@ -132,6 +134,30 @@ class HFDataStore:
 
     def _is_dirty(self) -> bool:
         return self._main_dirty or bool(self._assistant_dirty)
+
+    async def delete_assistant_data(self, assistant_id: str) -> None:
+        """Remove an assistant from memory and delete its HF file.
+
+        The main database is marked dirty so that ``assistant_ids`` is updated
+        on the next sync.  Any pending dirty flag for the assistant is cleared
+        to avoid re-uploading a file we just deleted.
+        """
+        self.data.get("assistants", {}).pop(assistant_id, None)
+        self._assistant_dirty.pop(assistant_id, None)
+        self._main_dirty = True  # assistant_ids list shrinks
+
+        def _delete() -> None:
+            try:
+                self.api.delete_file(
+                    path_in_repo=self._assistant_filename(assistant_id),
+                    repo_id=self.settings.hf_repo_id,
+                    repo_type="dataset",
+                    token=self.settings.hf_token,
+                )
+            except Exception:
+                logger.warning("Could not delete HF file for assistant %s (may not exist).", assistant_id)
+
+        await asyncio.to_thread(_delete)
 
     async def _upload_json(self, filename: str, payload: dict[str, Any]) -> None:
         with tempfile.NamedTemporaryFile("w", delete=False, suffix=".json", encoding="utf-8") as tf:

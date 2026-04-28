@@ -361,8 +361,7 @@ class MasterController:
                 return
             display = self._bot_display_name(aid, bot_data)
             await self.sessions.stop_assistant(aid)
-            assistants.pop(aid, None)
-            self.store.mark_dirty()
+            await self.store.delete_assistant_data(aid)
             await event.edit(f"Assistant {display} disconnected and removed.")
             return
 
@@ -411,8 +410,7 @@ class MasterController:
                 return
             aid = cb_data.split(":", 1)[1]
             await self.sessions.stop_assistant(aid)
-            self.store.get_data().get("assistants", {}).pop(aid, None)
-            self.store.mark_dirty()
+            await self.store.delete_assistant_data(aid)
             await event.edit("Disconnected.")
             return
 

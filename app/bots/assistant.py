@@ -36,6 +36,15 @@ class AssistantRuntime:
         self.assistant_id = assistant_id
         self.client = TelegramClient(session_path, settings.api_id, settings.api_hash)
         self.pending_actions: dict[int, dict[str, Any]] = {}
+        self._background_tasks: set[asyncio.Task] = set()
+
+    def _create_background_task(self, coro: Any) -> asyncio.Task:
+        """Schedule *coro* as a background task and keep a weak reference to it
+        so that it can be cancelled during graceful shutdown."""
+        task: asyncio.Task = asyncio.create_task(coro)
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+        return task
 
     @property
     def data(self) -> dict[str, Any]:
@@ -55,6 +64,11 @@ class AssistantRuntime:
         self._register_handlers()
 
     async def stop(self) -> None:
+        # Cancel in-flight background tasks (logging, broadcast) before disconnecting.
+        for task in list(self._background_tasks):
+            task.cancel()
+        if self._background_tasks:
+            await asyncio.gather(*self._background_tasks, return_exceptions=True)
         await self.client.disconnect()
 
     def _register_handlers(self) -> None:
@@ -239,7 +253,7 @@ class AssistantRuntime:
         self.store.mark_dirty(self.assistant_id)
 
         # Fire-and-forget: logging should not block the response to the user.
-        asyncio.create_task(self._log_user_message(event, event.sender_id))
+        self._create_background_task(self._log_user_message(event, event.sender_id))
         await self._apply_auto_reply(event.sender_id, is_start)
 
     def _stats_text(self) -> str:
@@ -386,5 +400,5 @@ class AssistantRuntime:
             self.pending_actions.pop(sender_id, None)
             msg = await event.edit("Broadcast started...")
             # Run broadcast as a background task so the callback returns immediately.
-            asyncio.create_task(self._broadcast(sender_id, payload, msg))
+            self._create_background_task(self._broadcast(sender_id, payload, msg))
             return
