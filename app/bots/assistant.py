@@ -17,6 +17,7 @@ from telethon.tl.custom.message import Message
 from app.config import Settings
 from app.storage.hf_dataset import HFDataStore
 from app.utils.media import send_payload, serialize_message
+from app.worker import Priority, WorkerPool
 
 logger = logging.getLogger(__name__)
 
@@ -36,15 +37,8 @@ class AssistantRuntime:
         self.assistant_id = assistant_id
         self.client = TelegramClient(session_path, settings.api_id, settings.api_hash)
         self.pending_actions: dict[int, dict[str, Any]] = {}
-        self._background_tasks: set[asyncio.Task] = set()
-
-    def _create_background_task(self, coro: Any) -> asyncio.Task:
-        """Schedule *coro* as a background task and keep a weak reference to it
-        so that it can be cancelled during graceful shutdown."""
-        task: asyncio.Task = asyncio.create_task(coro)
-        self._background_tasks.add(task)
-        task.add_done_callback(self._background_tasks.discard)
-        return task
+        # Each assistant has its own isolated worker pool.
+        self._pool = WorkerPool(assistant_id)
 
     @property
     def data(self) -> dict[str, Any]:
@@ -61,14 +55,12 @@ class AssistantRuntime:
 
     async def start(self) -> None:
         await self.client.start()
+        await self._pool.start()
         self._register_handlers()
 
     async def stop(self) -> None:
-        # Cancel in-flight background tasks (logging, broadcast) before disconnecting.
-        for task in list(self._background_tasks):
-            task.cancel()
-        if self._background_tasks:
-            await asyncio.gather(*self._background_tasks, return_exceptions=True)
+        # Stop the pool first (drains / cancels in-flight tasks) then disconnect.
+        await self._pool.stop()
         await self.client.disconnect()
 
     def _register_handlers(self) -> None:
@@ -93,12 +85,18 @@ class AssistantRuntime:
         return users[user_key]
 
     async def _log_user_message(self, event: events.NewMessage.Event, user_id: int) -> None:
-        """Forward a user message to the log chat. Runs as a background task."""
+        """Forward a user message to the log chat.
+
+        Runs as a LOG-priority task in the worker pool so it never blocks the
+        event handler.  Each Telegram API call is gated by ``api_sem``.
+        """
         try:
             target = self.data.get("log_chat_id") or self.data["owner_id"]
             header = f"📩 Assistant {self.assistant_id}\nFrom: `{user_id}`"
-            await self.client.send_message(target, header)
-            forwarded = await event.message.forward_to(target)
+            async with self._pool.api_sem:
+                await self.client.send_message(target, header)
+            async with self._pool.api_sem:
+                forwarded = await event.message.forward_to(target)
             reply_map = self.data.setdefault("reply_map", {})
             reply_map[str(forwarded.id)] = user_id
             self.store.mark_dirty(self.assistant_id)
@@ -110,9 +108,14 @@ class AssistantRuntime:
             )
 
     async def _apply_auto_reply(self, user_id: int, is_start: bool) -> None:
+        """Send the configured auto-reply.
+
+        Runs as a USER-priority task in the worker pool; gated by ``api_sem``.
+        """
         payload = self.data.get("start_post") if is_start else self.data.get("setmsg")
         if payload:
-            await send_payload(self.client, user_id, payload)
+            async with self._pool.api_sem:
+                await send_payload(self.client, user_id, payload)
 
     async def _handle_admin_command(self, event: events.NewMessage.Event) -> bool:
         text = (event.raw_text or "").strip()
@@ -178,8 +181,10 @@ class AssistantRuntime:
         if not user_id:
             return False
 
-        payload = await serialize_message(self.client, event.message)
-        await send_payload(self.client, user_id, payload)
+        async with self._pool.api_sem:
+            payload = await serialize_message(self.client, event.message)
+        async with self._pool.api_sem:
+            await send_payload(self.client, user_id, payload)
         return True
 
     async def _handle_pending_action(self, event: events.NewMessage.Event) -> bool:
@@ -193,7 +198,8 @@ class AssistantRuntime:
             return True
 
         if action["type"] in {"set_start", "set_msg"}:
-            payload = await serialize_message(self.client, event.message)
+            async with self._pool.api_sem:
+                payload = await serialize_message(self.client, event.message)
             if action["type"] == "set_start":
                 self.data["start_post"] = payload
             else:
@@ -204,7 +210,8 @@ class AssistantRuntime:
             return True
 
         if action["type"] == "broadcast_prepare":
-            payload = await serialize_message(self.client, event.message)
+            async with self._pool.api_sem:
+                payload = await serialize_message(self.client, event.message)
             self.pending_actions[event.sender_id or 0] = {"type": "broadcast_confirm", "payload": payload}
             await event.reply(
                 "Are you sure you want to broadcast to all users?",
@@ -252,9 +259,14 @@ class AssistantRuntime:
 
         self.store.mark_dirty(self.assistant_id)
 
-        # Fire-and-forget: logging should not block the response to the user.
-        self._create_background_task(self._log_user_message(event, event.sender_id))
-        await self._apply_auto_reply(event.sender_id, is_start)
+        # Hand off to the priority worker pool so the event handler returns
+        # immediately.  LOG tasks are processed before USER tasks.
+        self._pool.enqueue_nowait(
+            self._log_user_message(event, event.sender_id), Priority.LOG
+        )
+        self._pool.enqueue_nowait(
+            self._apply_auto_reply(event.sender_id, is_start), Priority.USER
+        )
 
     def _stats_text(self) -> str:
         users = self.data.get("users", {})
@@ -272,77 +284,112 @@ class AssistantRuntime:
             f"Total admins: {len(admins)}\n"
             f"Admin IDs: {', '.join(map(str, admins))}\n"
             f"Total /start count: {stats.get('total_starts', 0)}\n"
-            f"Total messages count: {stats.get('total_messages', 0)}"
+            f"Total messages count: {stats.get('total_messages', 0)}\n"
+            f"Worker pool — queue: {self._pool.queue_depth()} "
+            f"| active workers: {self._pool.active_workers()}"
         )
+
+    async def _broadcast_progress(
+        self,
+        status_msg: Message,
+        counters: dict[str, int],
+        total: int,
+        started: float,
+    ) -> None:
+        """Periodically edit the status message with broadcast progress."""
+        last_pct = -1
+        while True:
+            await asyncio.sleep(3)
+            done = counters["success"] + counters["failed"]
+            pct = int(done / total * 100) if total else 100
+            if pct != last_pct:
+                last_pct = pct
+                elapsed = max(time.time() - started, self.MIN_ELAPSED_TIME_SECONDS)
+                speed = done / elapsed
+                remaining = total - done
+                eta = int(remaining / speed) if speed > 0 else 0
+                try:
+                    await status_msg.edit(
+                        f"{pct}% completed\n"
+                        f"Sent: {done}/{total}\n"
+                        f"ETA: {eta}s\n"
+                        f"Speed: {speed:.2f} msg/sec"
+                    )
+                except Exception:
+                    pass
 
     async def _broadcast(self, admin_id: int, payload: dict[str, Any], status_msg: Message) -> None:
-        blocked_users = set(self.data.get("blocked_users", []))
-        users = []
-        for user_key in self.data.get("users", {}).keys():
-            user_id = int(user_key)
-            if user_id not in blocked_users:
-                users.append(user_id)
-        total = len(users)
-        if total == 0:
-            await status_msg.edit("No users to broadcast.")
-            return
+        """Concurrent broadcast using the pool's ``api_sem`` to rate-limit sends.
 
-        success = failed = blocked = 0
-        started = time.time()
-        checkpoints = {25, 50, 75, 100}
-        completed_marks: set[int] = set()
+        All per-user sends run concurrently via ``asyncio.gather`` with each
+        individual call gated by ``api_sem`` (max ``WorkerPool.API_CONCURRENCY``
+        simultaneous sends).  ``broadcast_lock`` prevents two overlapping
+        broadcasts on the same assistant bot.
+        """
+        async with self._pool.broadcast_lock:
+            blocked_users = set(self.data.get("blocked_users", []))
+            users = [
+                int(k)
+                for k in self.data.get("users", {})
+                if int(k) not in blocked_users
+            ]
+            total = len(users)
+            if total == 0:
+                await status_msg.edit("No users to broadcast.")
+                return
 
-        for index, user_id in enumerate(users, start=1):
-            try:
-                await send_payload(self.client, user_id, payload)
-                success += 1
-                await asyncio.sleep(0.05)
-            except FloodWaitError as e:
-                await asyncio.sleep(max(1, int(e.seconds)))
+            counters: dict[str, int] = {"success": 0, "failed": 0, "blocked": 0}
+            started = time.time()
+
+            async def send_one(user_id: int) -> None:
                 try:
-                    await send_payload(self.client, user_id, payload)
-                    success += 1
+                    async with self._pool.api_sem:
+                        await send_payload(self.client, user_id, payload)
+                    counters["success"] += 1
+                except FloodWaitError as e:
+                    await asyncio.sleep(max(1, int(e.seconds)))
+                    try:
+                        async with self._pool.api_sem:
+                            await send_payload(self.client, user_id, payload)
+                        counters["success"] += 1
+                    except Exception:
+                        counters["failed"] += 1
+                except (UserIsBlockedError, InputUserDeactivatedError, ChatWriteForbiddenError):
+                    counters["blocked"] += 1
+                    counters["failed"] += 1
+                    if user_id not in self.data.setdefault("blocked_users", []):
+                        self.data["blocked_users"].append(user_id)
+                        self.store.mark_dirty(self.assistant_id)
+                except PeerFloodError:
+                    await asyncio.sleep(2)
+                    counters["failed"] += 1
                 except Exception:
-                    failed += 1
-            except (UserIsBlockedError, InputUserDeactivatedError, ChatWriteForbiddenError):
-                blocked += 1
-                failed += 1
-                if user_id not in self.data.setdefault("blocked_users", []):
-                    self.data["blocked_users"].append(user_id)
-                    self.store.mark_dirty(self.assistant_id)
-            except PeerFloodError:
-                await asyncio.sleep(2)
-                failed += 1
-            except Exception:
-                failed += 1
+                    counters["failed"] += 1
 
-            progress = int(index / total * 100)
-            hit = [x for x in checkpoints if progress >= x and x not in completed_marks]
-            if hit:
-                mark = max(hit)
-                completed_marks.add(mark)
-                # Keep divisor non-zero for speed/ETA calculations.
-                elapsed = max(time.time() - started, self.MIN_ELAPSED_TIME_SECONDS)
-                speed = index / elapsed
-                remaining = total - index
-                eta = int(remaining / speed)
-                await status_msg.edit(
-                    f"{mark}% completed\n"
-                    f"Sent: {index}/{total}\n"
-                    f"ETA: {eta}s\n"
-                    f"Speed: {speed:.2f} msg/sec"
+            progress_task = asyncio.create_task(
+                self._broadcast_progress(status_msg, counters, total, started)
+            )
+            try:
+                await asyncio.gather(
+                    *(send_one(uid) for uid in users), return_exceptions=True
                 )
+            finally:
+                progress_task.cancel()
+                try:
+                    await progress_task
+                except asyncio.CancelledError:
+                    pass
 
-        duration = int(time.time() - started)
-        self.store.mark_dirty(self.assistant_id)
-        await status_msg.edit(
-            "Broadcast Completed ✅\n\n"
-            f"Total Users: {total}\n"
-            f"Sent: {success}\n"
-            f"Failed: {failed}\n"
-            f"Blocked: {blocked}\n"
-            f"Time Taken: {duration} seconds"
-        )
+            duration = int(time.time() - started)
+            self.store.mark_dirty(self.assistant_id)
+            await status_msg.edit(
+                "Broadcast Completed ✅\n\n"
+                f"Total Users: {total}\n"
+                f"Sent: {counters['success']}\n"
+                f"Failed: {counters['failed']}\n"
+                f"Blocked: {counters['blocked']}\n"
+                f"Time Taken: {duration} seconds"
+            )
 
     async def _on_callback(self, event: events.CallbackQuery.Event) -> None:
         sender_id = event.sender_id or 0
@@ -399,6 +446,9 @@ class AssistantRuntime:
             payload = action["payload"]
             self.pending_actions.pop(sender_id, None)
             msg = await event.edit("Broadcast started...")
-            # Run broadcast as a background task so the callback returns immediately.
-            self._create_background_task(self._broadcast(sender_id, payload, msg))
+            # Enqueue the broadcast at BROADCAST (highest) priority through the
+            # worker pool so it is picked up before any pending LOG/USER tasks.
+            self._pool.enqueue_nowait(
+                self._broadcast(sender_id, payload, msg), Priority.BROADCAST
+            )
             return
