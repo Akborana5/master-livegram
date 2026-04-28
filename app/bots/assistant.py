@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import time
 from datetime import datetime, timezone
 from typing import Any
@@ -16,6 +17,8 @@ from telethon.tl.custom.message import Message
 from app.config import Settings
 from app.storage.hf_dataset import HFDataStore
 from app.utils.media import send_payload, serialize_message
+
+logger = logging.getLogger(__name__)
 
 
 class AssistantRuntime:
@@ -76,13 +79,21 @@ class AssistantRuntime:
         return users[user_key]
 
     async def _log_user_message(self, event: events.NewMessage.Event, user_id: int) -> None:
-        target = self.data.get("log_chat_id") or self.data["owner_id"]
-        header = f"📩 Assistant {self.assistant_id}\nFrom: `{user_id}`"
-        await self.client.send_message(target, header)
-        forwarded = await event.message.forward_to(target)
-        reply_map = self.data.setdefault("reply_map", {})
-        reply_map[str(forwarded.id)] = user_id
-        self.store.mark_dirty()
+        """Forward a user message to the log chat. Runs as a background task."""
+        try:
+            target = self.data.get("log_chat_id") or self.data["owner_id"]
+            header = f"📩 Assistant {self.assistant_id}\nFrom: `{user_id}`"
+            await self.client.send_message(target, header)
+            forwarded = await event.message.forward_to(target)
+            reply_map = self.data.setdefault("reply_map", {})
+            reply_map[str(forwarded.id)] = user_id
+            self.store.mark_dirty(self.assistant_id)
+        except Exception:
+            logger.exception(
+                "Error logging message for assistant %s from user %s",
+                self.assistant_id,
+                user_id,
+            )
 
     async def _apply_auto_reply(self, user_id: int, is_start: bool) -> None:
         payload = self.data.get("start_post") if is_start else self.data.get("setmsg")
@@ -129,7 +140,7 @@ class AssistantRuntime:
                     self.data["admins"].append(target)
             elif command == "/demote":
                 self.data["admins"] = [x for x in self.data.get("admins", []) if x != target]
-            self.store.mark_dirty()
+            self.store.mark_dirty(self.assistant_id)
             await event.reply("Updated.")
             return True
 
@@ -173,7 +184,7 @@ class AssistantRuntime:
                 self.data["start_post"] = payload
             else:
                 self.data["setmsg"] = payload
-            self.store.mark_dirty()
+            self.store.mark_dirty(self.assistant_id)
             self.pending_actions.pop(event.sender_id or 0, None)
             await event.reply("Saved.")
             return True
@@ -197,7 +208,7 @@ class AssistantRuntime:
             return
 
         self.data["last_active_at"] = datetime.now(timezone.utc).isoformat()
-        self.store.mark_dirty()
+        self.store.mark_dirty(self.assistant_id)
 
         if self._is_admin(event.sender_id):
             if await self._handle_pending_action(event):
@@ -225,9 +236,10 @@ class AssistantRuntime:
             user_data["start_count"] += 1
             self.data["stats"]["total_starts"] += 1
 
-        self.store.mark_dirty()
+        self.store.mark_dirty(self.assistant_id)
 
-        await self._log_user_message(event, event.sender_id)
+        # Fire-and-forget: logging should not block the response to the user.
+        asyncio.create_task(self._log_user_message(event, event.sender_id))
         await self._apply_auto_reply(event.sender_id, is_start)
 
     def _stats_text(self) -> str:
@@ -283,7 +295,7 @@ class AssistantRuntime:
                 failed += 1
                 if user_id not in self.data.setdefault("blocked_users", []):
                     self.data["blocked_users"].append(user_id)
-                    self.store.mark_dirty()
+                    self.store.mark_dirty(self.assistant_id)
             except PeerFloodError:
                 await asyncio.sleep(2)
                 failed += 1
@@ -308,7 +320,7 @@ class AssistantRuntime:
                 )
 
         duration = int(time.time() - started)
-        self.store.mark_dirty()
+        self.store.mark_dirty(self.assistant_id)
         await status_msg.edit(
             "Broadcast Completed ✅\n\n"
             f"Total Users: {total}\n"
@@ -324,33 +336,48 @@ class AssistantRuntime:
             await event.answer("Not allowed", alert=True)
             return
 
-        data = (event.data or b"").decode("utf-8")
-        if data == f"asetstart:{self.assistant_id}":
+        cb_data = (event.data or b"").decode("utf-8")
+
+        if cb_data == f"acancel:{self.assistant_id}":
+            self.pending_actions.pop(sender_id, None)
+            await event.edit("Cancelled.")
+            return
+
+        if cb_data == f"asetstart:{self.assistant_id}":
             self.pending_actions[sender_id] = {"type": "set_start"}
-            await event.edit("Send STARTPOST message now, or type Cancel.")
+            await event.edit(
+                "Send STARTPOST message now, or press Cancel.",
+                buttons=[[Button.inline("❌ Cancel", data=f"acancel:{self.assistant_id}")]],
+            )
             return
 
-        if data == f"asetmsg:{self.assistant_id}":
+        if cb_data == f"asetmsg:{self.assistant_id}":
             self.pending_actions[sender_id] = {"type": "set_msg"}
-            await event.edit("Send SETMSG message now, or type Cancel.")
+            await event.edit(
+                "Send SETMSG message now, or press Cancel.",
+                buttons=[[Button.inline("❌ Cancel", data=f"acancel:{self.assistant_id}")]],
+            )
             return
 
-        if data == f"astats:{self.assistant_id}":
+        if cb_data == f"astats:{self.assistant_id}":
             await event.edit("Processing...")
             await event.edit(self._stats_text())
             return
 
-        if data == f"abroadcast:{self.assistant_id}":
+        if cb_data == f"abroadcast:{self.assistant_id}":
             self.pending_actions[sender_id] = {"type": "broadcast_prepare"}
-            await event.edit("Send broadcast message now (text/media), or type Cancel.")
+            await event.edit(
+                "Send broadcast message now (text/media), or press Cancel.",
+                buttons=[[Button.inline("❌ Cancel", data=f"acancel:{self.assistant_id}")]],
+            )
             return
 
-        if data == f"abcancel:{self.assistant_id}":
+        if cb_data == f"abcancel:{self.assistant_id}":
             self.pending_actions.pop(sender_id, None)
             await event.edit("Broadcast cancelled.")
             return
 
-        if data == f"abcyes:{self.assistant_id}":
+        if cb_data == f"abcyes:{self.assistant_id}":
             action = self.pending_actions.get(sender_id)
             if not action or action.get("type") != "broadcast_confirm":
                 await event.answer("No pending broadcast", alert=True)
@@ -358,5 +385,6 @@ class AssistantRuntime:
             payload = action["payload"]
             self.pending_actions.pop(sender_id, None)
             msg = await event.edit("Broadcast started...")
-            await self._broadcast(sender_id, payload, msg)
+            # Run broadcast as a background task so the callback returns immediately.
+            asyncio.create_task(self._broadcast(sender_id, payload, msg))
             return
