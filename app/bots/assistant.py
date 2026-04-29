@@ -260,12 +260,12 @@ class AssistantRuntime:
         self.store.mark_dirty(self.assistant_id)
 
         # Hand off to the priority worker pool so the event handler returns
-        # immediately.  LOG tasks are processed before USER tasks.
-        self._pool.enqueue_nowait(
-            self._log_user_message(event, event.sender_id), Priority.LOG
-        )
+        # immediately.  USER replies are processed before LOG forwarding.
         self._pool.enqueue_nowait(
             self._apply_auto_reply(event.sender_id, is_start), Priority.USER
+        )
+        self._pool.enqueue_nowait(
+            self._log_user_message(event, event.sender_id), Priority.LOG
         )
 
     def _stats_text(self) -> str:
@@ -319,12 +319,17 @@ class AssistantRuntime:
                     pass
 
     async def _broadcast(self, admin_id: int, payload: dict[str, Any], status_msg: Message) -> None:
-        """Concurrent broadcast using the pool's ``api_sem`` to rate-limit sends.
+        """Queue-based broadcast: one coroutine per recipient, processed by the pool.
 
-        All per-user sends run concurrently via ``asyncio.gather`` with each
-        individual call gated by ``api_sem`` (max ``WorkerPool.API_CONCURRENCY``
-        simultaneous sends).  ``broadcast_lock`` prevents two overlapping
-        broadcasts on the same assistant bot.
+        Instead of spawning thousands of Tasks via ``asyncio.gather``, a single
+        lightweight coroutine is enqueued per recipient into the dedicated
+        broadcast queue.  Workers drain it concurrently, gated by ``api_sem``.
+        Memory usage stays bounded because coroutines (unlike Tasks) are cheap
+        and sit dormant in the queue until a worker picks them up.
+
+        A ``remaining`` counter decremented in each coroutine's ``finally``
+        block fires an ``asyncio.Event`` when all sends have finished, at which
+        point the summary is written and ``broadcast_lock`` is released.
         """
         async with self._pool.broadcast_lock:
             blocked_users = set(self.data.get("blocked_users", []))
@@ -339,6 +344,10 @@ class AssistantRuntime:
                 return
 
             counters: dict[str, int] = {"success": 0, "failed": 0, "blocked": 0}
+            # List wrapper allows mutation from the nested coroutine without
+            # nonlocal — safe because asyncio is single-threaded.
+            remaining = [total]
+            done_event = asyncio.Event()
             started = time.time()
 
             async def send_one(user_id: int) -> None:
@@ -365,12 +374,20 @@ class AssistantRuntime:
                     counters["failed"] += 1
                 except Exception:
                     counters["failed"] += 1
+                finally:
+                    remaining[0] -= 1
+                    if remaining[0] == 0:
+                        done_event.set()
+
+            # Enqueue one coroutine per recipient — no mass Task creation.
+            for uid in users:
+                self._pool.enqueue_nowait(send_one(uid), Priority.BROADCAST)
 
             progress_task = asyncio.create_task(
                 self._broadcast_progress(status_msg, counters, total, started)
             )
             try:
-                await asyncio.gather(*(send_one(uid) for uid in users))
+                await done_event.wait()
             finally:
                 progress_task.cancel()
                 try:
@@ -444,9 +461,11 @@ class AssistantRuntime:
             payload = action["payload"]
             self.pending_actions.pop(sender_id, None)
             msg = await event.edit("Broadcast started...")
-            # Enqueue the broadcast at BROADCAST (highest) priority through the
-            # worker pool so it is picked up before any pending LOG/USER tasks.
-            self._pool.enqueue_nowait(
-                self._broadcast(sender_id, payload, msg), Priority.BROADCAST
+            # Run the broadcast coordinator as a plain background task — it is
+            # not a pool item itself, but it enqueues individual per-recipient
+            # coroutines into the broadcast queue.
+            asyncio.create_task(
+                self._broadcast(sender_id, payload, msg),
+                name=f"broadcast-{self.assistant_id}-{sender_id}",
             )
             return
