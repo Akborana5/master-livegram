@@ -54,6 +54,11 @@ class MasterController:
         users.setdefault(str(user_id), {"joined_at": datetime.now(timezone.utc).isoformat()})
         self.store.mark_dirty()
 
+    def _bot_display_name(self, aid: str, data: dict[str, Any]) -> str:
+        """Return @username when available, otherwise fall back to the numeric ID."""
+        username = data.get("bot_username", "")
+        return f"@{username}" if username else f"Bot {aid}"
+
     async def _show_my_bots(self, event: events.common.EventCommon, owner_id: int) -> None:
         assistants = self.store.get_data().get("assistants", {})
         mine = [
@@ -64,7 +69,10 @@ class MasterController:
         if not mine:
             await event.reply("No assistant bots connected.")
             return
-        buttons = [[Button.inline(f"Bot {aid}", data=f"m_bstat:{aid}")] for aid, _ in mine]
+        buttons = [
+            [Button.inline(self._bot_display_name(aid, data), data=f"m_bstat:{aid}")]
+            for aid, data in mine
+        ]
         await event.reply("Your assistant bots:", buttons=buttons)
 
     def _assistant_stats(self, aid: str, data: dict[str, Any]) -> str:
@@ -74,8 +82,9 @@ class MasterController:
         blocked = len(data.get("blocked_users", []))
         non_premium = total - premium
         admin_count = self._assistant_admin_count(data)
+        display = self._bot_display_name(aid, data)
         return (
-            f"Assistant: {aid}\n"
+            f"Assistant: {display}\n"
             f"Total users: {total}\n"
             f"Premium users: {premium}\n"
             f"Non-premium users: {non_premium}\n"
@@ -104,8 +113,9 @@ class MasterController:
             f"Total assistant bots: {len(assistants)}"
         )
         buttons = [[Button.inline("GLOBAL SYNC", data="m_sync")]]
-        for aid in assistants:
-            buttons.append([Button.inline(f"BOT {aid}", data=f"m_adminbot:{aid}")])
+        for aid, data in assistants.items():
+            label = self._bot_display_name(aid, data)
+            buttons.append([Button.inline(label, data=f"m_adminbot:{aid}")])
         await event.reply(text, buttons=buttons)
 
     async def _activate_assistant(self, user_id: int) -> None:
@@ -122,14 +132,16 @@ class MasterController:
                 self.pending_connect.pop(user_id, None)
                 return
             existing["session_b64"] = pending["session_b64"]
+            existing["bot_username"] = pending.get("bot_username", existing.get("bot_username", ""))
             existing["last_active_at"] = datetime.now(timezone.utc).isoformat()
             await self.sessions.stop_assistant(old_id)
             await self.sessions.start_assistant(old_id, existing)
             self.pending_connect.pop(user_id, None)
-            self.store.mark_dirty()
+            self.store.mark_dirty(old_id)
             return
         assistants[assistant_id] = {
             "assistant_id": assistant_id,
+            "bot_username": pending.get("bot_username", ""),
             "owner_id": user_id,
             "session_b64": pending["session_b64"],
             "log_chat_id": pending.get("log_chat_id"),
@@ -143,7 +155,9 @@ class MasterController:
             "start_post": None,
             "setmsg": None,
         }
+        # Mark main dirty (assistant_ids list grows) and assistant dirty (new file).
         self.store.mark_dirty()
+        self.store.mark_dirty(assistant_id)
         await self.sessions.start_assistant(assistant_id, assistants[assistant_id])
         self.pending_connect.pop(user_id, None)
 
@@ -166,6 +180,7 @@ class MasterController:
                 if not me:
                     raise ValueError("Invalid session")
                 pending["assistant_id"] = str(me.id)
+                pending["bot_username"] = me.username or ""
                 if pending.get("mode") == "replace" and pending.get("target_assistant_id") != str(me.id):
                     await event.reply("Session user ID does not match selected assistant bot.")
                     return True
@@ -185,7 +200,10 @@ class MasterController:
         await event.reply(
             "Add this assistant bot to a group and make it admin for logs.\n"
             "Send log group ID now or press SKIP.",
-            buttons=[[Button.inline("SKIP", data="m_skiplog")]],
+            buttons=[
+                [Button.inline("SKIP", data="m_skiplog")],
+                [Button.inline("❌ Cancel", data="m_cancel")],
+            ],
         )
         return True
 
@@ -268,18 +286,26 @@ class MasterController:
 
     async def _on_callback(self, event: events.CallbackQuery.Event) -> None:
         user_id = event.sender_id or 0
-        data = (event.data or b"").decode("utf-8")
+        cb_data = (event.data or b"").decode("utf-8")
 
         if self._is_banned(user_id):
             await event.answer("Banned", alert=True)
             return
 
-        if data == "m_connect":
+        if cb_data == "m_connect":
             self.pending_connect[user_id] = {"step": "upload", "mode": "connect"}
-            await event.edit("Upload your .session file now.")
+            await event.edit(
+                "Upload your .session file now.",
+                buttons=[[Button.inline("❌ Cancel", data="m_cancel")]],
+            )
             return
 
-        if data == "m_skiplog":
+        if cb_data == "m_cancel":
+            self.pending_connect.pop(user_id, None)
+            await event.edit("Cancelled.", buttons=self._main_menu())
+            return
+
+        if cb_data == "m_skiplog":
             pending = self.pending_connect.get(user_id)
             if pending and pending.get("step") == "log_chat":
                 pending["log_chat_id"] = None
@@ -289,13 +315,13 @@ class MasterController:
                 await event.answer("No pending connect flow", alert=True)
             return
 
-        if data == "m_mybots":
+        if cb_data == "m_mybots":
             await event.edit("Loading your bots...")
             await self._show_my_bots(event, user_id)
             return
 
-        if data.startswith("m_bstat:"):
-            aid = data.split(":", 1)[1]
+        if cb_data.startswith("m_bstat:"):
+            aid = cb_data.split(":", 1)[1]
             bot_data = self.store.get_data().get("assistants", {}).get(aid)
             if not bot_data:
                 await event.answer("Not found", alert=True)
@@ -306,22 +332,25 @@ class MasterController:
             await event.edit(self._assistant_stats(aid, bot_data))
             return
 
-        if data == "m_disconnect":
+        if cb_data == "m_disconnect":
             assistants = self.store.get_data().get("assistants", {})
             mine = [
-                aid
+                (aid, item)
                 for aid, item in assistants.items()
                 if item.get("owner_id") == user_id or self._is_admin(user_id)
             ]
             if not mine:
                 await event.edit("No assistant bots to disconnect.")
                 return
-            buttons = [[Button.inline(f"Disconnect {aid}", data=f"m_disco:{aid}")] for aid in mine]
+            buttons = [
+                [Button.inline(f"Disconnect {self._bot_display_name(aid, item)}", data=f"m_disco:{aid}")]
+                for aid, item in mine
+            ]
             await event.edit("Select bot to disconnect:", buttons=buttons)
             return
 
-        if data.startswith("m_disco:"):
-            aid = data.split(":", 1)[1]
+        if cb_data.startswith("m_disco:"):
+            aid = cb_data.split(":", 1)[1]
             assistants = self.store.get_data().get("assistants", {})
             bot_data = assistants.get(aid)
             if not bot_data:
@@ -330,20 +359,20 @@ class MasterController:
             if bot_data.get("owner_id") != user_id and not self._is_admin(user_id):
                 await event.answer("Not allowed", alert=True)
                 return
+            display = self._bot_display_name(aid, bot_data)
             await self.sessions.stop_assistant(aid)
-            assistants.pop(aid, None)
-            self.store.mark_dirty()
-            await event.edit(f"Assistant {aid} disconnected and removed.")
+            await self.store.delete_assistant_data(aid)
+            await event.edit(f"Assistant {display} disconnected and removed.")
             return
 
-        if data == "m_admin":
+        if cb_data == "m_admin":
             if not self._is_admin(user_id):
                 await event.answer("Admin only", alert=True)
                 return
             await self._admin_panel(event)
             return
 
-        if data == "m_sync":
+        if cb_data == "m_sync":
             if not self._is_admin(user_id):
                 await event.answer("Admin only", alert=True)
                 return
@@ -352,11 +381,11 @@ class MasterController:
             await event.edit("HF dataset sync complete.")
             return
 
-        if data.startswith("m_adminbot:"):
+        if cb_data.startswith("m_adminbot:"):
             if not self._is_admin(user_id):
                 await event.answer("Admin only", alert=True)
                 return
-            aid = data.split(":", 1)[1]
+            aid = cb_data.split(":", 1)[1]
             bot_data = self.store.get_data().get("assistants", {}).get(aid)
             if not bot_data:
                 await event.answer("Not found", alert=True)
@@ -375,37 +404,36 @@ class MasterController:
             )
             return
 
-        if data.startswith("m_adisco:"):
+        if cb_data.startswith("m_adisco:"):
             if not self._is_admin(user_id):
                 await event.answer("Admin only", alert=True)
                 return
-            aid = data.split(":", 1)[1]
+            aid = cb_data.split(":", 1)[1]
             await self.sessions.stop_assistant(aid)
-            self.store.get_data().get("assistants", {}).pop(aid, None)
-            self.store.mark_dirty()
+            await self.store.delete_assistant_data(aid)
             await event.edit("Disconnected.")
             return
 
-        if data.startswith("m_awipe:"):
+        if cb_data.startswith("m_awipe:"):
             if not self._is_admin(user_id):
                 await event.answer("Admin only", alert=True)
                 return
-            aid = data.split(":", 1)[1]
+            aid = cb_data.split(":", 1)[1]
             data_ref = self.store.get_data().get("assistants", {}).get(aid)
             if data_ref:
                 data_ref["users"] = {}
                 data_ref["blocked_users"] = []
                 data_ref["reply_map"] = {}
                 data_ref["stats"] = {"total_starts": 0, "total_messages": 0}
-                self.store.mark_dirty()
+                self.store.mark_dirty(aid)
             await event.edit("Assistant data wiped.")
             return
 
-        if data.startswith("m_areplace:"):
+        if cb_data.startswith("m_areplace:"):
             if not self._is_admin(user_id):
                 await event.answer("Admin only", alert=True)
                 return
-            aid = data.split(":", 1)[1]
+            aid = cb_data.split(":", 1)[1]
             if aid not in self.store.get_data().get("assistants", {}):
                 await event.answer("Not found", alert=True)
                 return
@@ -414,5 +442,8 @@ class MasterController:
                 "mode": "replace",
                 "target_assistant_id": aid,
             }
-            await event.edit(f"Upload replacement .session for assistant {aid}.")
+            await event.edit(
+                f"Upload replacement .session for assistant {aid}.",
+                buttons=[[Button.inline("❌ Cancel", data="m_cancel")]],
+            )
             return
