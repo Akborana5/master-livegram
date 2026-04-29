@@ -139,6 +139,9 @@ class WorkerPool:
                 item = await asyncio.wait_for(self._queue.get(), timeout=5.0)
             except asyncio.TimeoutError:
                 # No work arrived within the window.
+                # Reset the timer at the start of each idle period so that a
+                # worker that processes some tasks and then goes idle again
+                # gets a fresh SCALE_DOWN_IDLE window.
                 if idle_since is None:
                     idle_since = time.monotonic()
                 if (

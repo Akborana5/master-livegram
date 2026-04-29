@@ -370,9 +370,7 @@ class AssistantRuntime:
                 self._broadcast_progress(status_msg, counters, total, started)
             )
             try:
-                await asyncio.gather(
-                    *(send_one(uid) for uid in users), return_exceptions=True
-                )
+                await asyncio.gather(*(send_one(uid) for uid in users))
             finally:
                 progress_task.cancel()
                 try:
