@@ -26,6 +26,14 @@ Worker types:
                            Guarantees bot responsiveness even during a broadcast.
   Flexible workers       – prefer _bc_queue; fall back to _msg_queue.
                            Scaled up/down dynamically by the scaler task.
+
+Scaling
+-------
+The scaler runs every 2 seconds and checks the *total* queue depth
+(_bc_queue + _msg_queue).  When the combined depth reaches SCALE_UP_THRESHOLD
+(10 items) a new flexible worker is spawned, up to MAX_FLEXIBLE_WORKERS.
+At least 1 flexible worker is kept alive at all times; excess idle workers
+scale down after SCALE_DOWN_IDLE seconds of inactivity.
 """
 
 import asyncio
@@ -65,8 +73,9 @@ class WorkerPool:
     """
 
     RESERVED_USER_WORKERS: int = 3   # always-on workers dedicated to user/log messages
+    MIN_FLEXIBLE_WORKERS: int = 1    # minimum flexible workers kept alive at all times
     MAX_FLEXIBLE_WORKERS: int = 7    # flexible workers that prioritise broadcast items
-    SCALE_UP_THRESHOLD: int = 5      # bc_queue depth that triggers a new flexible worker
+    SCALE_UP_THRESHOLD: int = 10     # combined queue depth (bc + msg) that triggers a new flexible worker
     SCALE_DOWN_IDLE: float = 30.0    # idle seconds before a flexible worker exits
     API_CONCURRENCY: int = 8         # max simultaneous Telegram API calls
 
@@ -121,6 +130,22 @@ class WorkerPool:
             1 for w in self._flexible_workers if not w.done()
         )
 
+    def bc_queue_depth(self) -> int:
+        """Return the number of items waiting in the broadcast queue."""
+        return self._bc_queue.qsize()
+
+    def msg_queue_depth(self) -> int:
+        """Return the number of items waiting in the user/log queue."""
+        return self._msg_queue.qsize()
+
+    def reserved_worker_count(self) -> int:
+        """Return the number of active reserved workers."""
+        return sum(1 for w in self._reserved_workers if not w.done())
+
+    def flexible_worker_count(self) -> int:
+        """Return the number of active flexible workers."""
+        return sum(1 for w in self._flexible_workers if not w.done())
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -136,9 +161,10 @@ class WorkerPool:
             self._scaler(), name=f"scaler-{self.assistant_id}"
         )
         logger.info(
-            "WorkerPool[%s] started — reserved=%d, max_flexible=%d, api_concurrency=%d",
+            "WorkerPool[%s] started — reserved=%d, min_flexible=%d, max_flexible=%d, api_concurrency=%d",
             self.assistant_id,
             self.RESERVED_USER_WORKERS,
+            self.MIN_FLEXIBLE_WORKERS,
             self.MAX_FLEXIBLE_WORKERS,
             self.API_CONCURRENCY,
         )
@@ -179,6 +205,12 @@ class WorkerPool:
             name=f"worker-{self.assistant_id}-flex-{wid}",
         )
         self._flexible_workers.append(task)
+        logger.debug(
+            "WorkerPool[%s] flex-worker-%d started (total flex=%d)",
+            self.assistant_id,
+            wid,
+            len(self._flexible_workers),
+        )
         return task
 
     async def _user_worker(self, worker_id: int) -> None:
@@ -209,7 +241,8 @@ class WorkerPool:
         Checks _bc_queue non-blocking first on every iteration so it switches
         to broadcast work within one loop cycle after items arrive.  Falls back
         to a 1-second blocking wait on _msg_queue to avoid busy-spinning.
-        Scales down after SCALE_DOWN_IDLE seconds of complete idleness.
+        Scales down after SCALE_DOWN_IDLE seconds of complete idleness, while
+        always keeping at least one flexible worker running.
         """
         idle_since: float | None = None
         while self._running:
@@ -236,7 +269,7 @@ class WorkerPool:
                         1 for w in self._flexible_workers if not w.done()
                     )
                     if (
-                        active_flex > 0
+                        active_flex > self.MIN_FLEXIBLE_WORKERS  # always keep minimum flexible workers
                         and time.monotonic() - idle_since >= self.SCALE_DOWN_IDLE
                     ):
                         logger.debug(
@@ -265,19 +298,45 @@ class WorkerPool:
                 else:
                     self._msg_queue.task_done()
 
+        logger.debug(
+            "WorkerPool[%s] flex-worker-%d exited",
+            self.assistant_id,
+            worker_id,
+        )
+
     async def _scaler(self) -> None:
-        """Periodically add a flexible worker when the broadcast queue is deep."""
+        """Periodically add flexible workers when total queue depth is high."""
         while self._running:
             await asyncio.sleep(2)
             # Remove references to completed flexible workers.
             self._flexible_workers = [w for w in self._flexible_workers if not w.done()]
+
             bc_depth = self._bc_queue.qsize()
+            msg_depth = self._msg_queue.qsize()
+            total_queue = bc_depth + msg_depth
             active_flex = len(self._flexible_workers)
-            if bc_depth >= self.SCALE_UP_THRESHOLD and active_flex < self.MAX_FLEXIBLE_WORKERS:
+
+            logger.debug(
+                "WorkerPool[%s] scaler — bc_queue=%d msg_queue=%d total=%d flex=%d",
+                self.assistant_id,
+                bc_depth,
+                msg_depth,
+                total_queue,
+                active_flex,
+            )
+
+            # Always keep at least MIN_FLEXIBLE_WORKERS flexible workers running.
+            if active_flex < self.MIN_FLEXIBLE_WORKERS:
                 self._add_flexible_worker()
                 logger.debug(
-                    "WorkerPool[%s] scaled up → %d flexible workers (bc queue depth=%d)",
+                    "WorkerPool[%s] spawned minimum flexible worker",
+                    self.assistant_id,
+                )
+            elif total_queue >= self.SCALE_UP_THRESHOLD and active_flex < self.MAX_FLEXIBLE_WORKERS:
+                self._add_flexible_worker()
+                logger.debug(
+                    "WorkerPool[%s] scaled up → %d flexible workers (total queue=%d)",
                     self.assistant_id,
                     active_flex + 1,
-                    bc_depth,
+                    total_queue,
                 )

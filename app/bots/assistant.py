@@ -285,8 +285,13 @@ class AssistantRuntime:
             f"Admin IDs: {', '.join(map(str, admins))}\n"
             f"Total /start count: {stats.get('total_starts', 0)}\n"
             f"Total messages count: {stats.get('total_messages', 0)}\n"
-            f"Worker pool — queue: {self._pool.queue_depth()} "
-            f"| active workers: {self._pool.active_workers()}"
+            f"Worker pool\n"
+            f"  bc_queue: {self._pool.bc_queue_depth()} "
+            f"| msg_queue: {self._pool.msg_queue_depth()} "
+            f"| total: {self._pool.queue_depth()}\n"
+            f"  reserved workers: {self._pool.reserved_worker_count()} "
+            f"| flex workers: {self._pool.flexible_worker_count()} "
+            f"| total: {self._pool.active_workers()}"
         )
 
     async def _broadcast_progress(
