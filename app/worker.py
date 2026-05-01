@@ -73,8 +73,9 @@ class WorkerPool:
     """
 
     RESERVED_USER_WORKERS: int = 3   # always-on workers dedicated to user/log messages
+    MIN_FLEXIBLE_WORKERS: int = 1    # minimum flexible workers kept alive at all times
     MAX_FLEXIBLE_WORKERS: int = 7    # flexible workers that prioritise broadcast items
-    SCALE_UP_THRESHOLD: int = 10     # total queue depth (bc + msg) that triggers a new flexible worker
+    SCALE_UP_THRESHOLD: int = 10     # combined queue depth (bc + msg) that triggers a new flexible worker
     SCALE_DOWN_IDLE: float = 30.0    # idle seconds before a flexible worker exits
     API_CONCURRENCY: int = 8         # max simultaneous Telegram API calls
 
@@ -160,9 +161,10 @@ class WorkerPool:
             self._scaler(), name=f"scaler-{self.assistant_id}"
         )
         logger.info(
-            "WorkerPool[%s] started — reserved=%d, max_flexible=%d, api_concurrency=%d",
+            "WorkerPool[%s] started — reserved=%d, min_flexible=%d, max_flexible=%d, api_concurrency=%d",
             self.assistant_id,
             self.RESERVED_USER_WORKERS,
+            self.MIN_FLEXIBLE_WORKERS,
             self.MAX_FLEXIBLE_WORKERS,
             self.API_CONCURRENCY,
         )
@@ -267,7 +269,7 @@ class WorkerPool:
                         1 for w in self._flexible_workers if not w.done()
                     )
                     if (
-                        active_flex > 1  # always keep at least 1 flexible worker
+                        active_flex > self.MIN_FLEXIBLE_WORKERS  # always keep minimum flexible workers
                         and time.monotonic() - idle_since >= self.SCALE_DOWN_IDLE
                     ):
                         logger.debug(
@@ -323,8 +325,8 @@ class WorkerPool:
                 active_flex,
             )
 
-            # Always keep at least 1 flexible worker running.
-            if active_flex == 0:
+            # Always keep at least MIN_FLEXIBLE_WORKERS flexible workers running.
+            if active_flex < self.MIN_FLEXIBLE_WORKERS:
                 self._add_flexible_worker()
                 logger.debug(
                     "WorkerPool[%s] spawned minimum flexible worker",
